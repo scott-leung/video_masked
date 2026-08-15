@@ -30,6 +30,12 @@ class CoreTests(unittest.TestCase):
             files = scan_media(root)
             self.assertEqual([str(f.relative) for f in files], [str(Path("sub/a.PNG"))])
 
+    def test_scan_excludes_nested_output(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); output = root / "output"; output.mkdir()
+            (root / "keep.jpg").write_bytes(b"x"); (output / "skip.jpg").write_bytes(b"x")
+            files = scan_media(root, output)
+            self.assertEqual([f.relative.name for f in files], ["keep.jpg"])
+
 
 if __name__ == "__main__": unittest.main()
-

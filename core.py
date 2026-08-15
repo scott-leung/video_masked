@@ -39,17 +39,29 @@ def scan_media(folder: Path, output_folder: Path | None = None) -> list[MediaFil
     folder = folder.resolve()
     excluded = output_folder.resolve() if output_folder else None
     found: list[MediaFile] = []
-    for root, dirs, names in os.walk(folder):
-        root_path = Path(root)
-        if excluded:
-            dirs[:] = [d for d in dirs if (root_path / d).resolve() != excluded]
-        for name in names:
-            path = root_path / name
-            if path.suffix.lower() in MEDIA_EXTENSIONS:
-                try:
-                    found.append(MediaFile(path, path.relative_to(folder), path.stat().st_size))
-                except OSError:
-                    continue
+    # scandir exposes Win32 directory metadata directly. Unlike Path.stat() in an
+    # os.walk loop, entry.stat() normally reuses that metadata and avoids an extra
+    # filesystem round-trip for every file (very noticeable on HDDs/NAS shares).
+    stack = [folder]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            child = Path(entry.path)
+                            if excluded is None or child != excluded:
+                                stack.append(child)
+                        elif entry.is_file(follow_symlinks=False):
+                            suffix = os.path.splitext(entry.name)[1].lower()
+                            if suffix in MEDIA_EXTENSIONS:
+                                path = Path(entry.path)
+                                found.append(MediaFile(path, path.relative_to(folder), entry.stat(follow_symlinks=False).st_size))
+                    except OSError:
+                        continue
+        except OSError:
+            continue
     return found
 
 
@@ -130,4 +142,3 @@ def sha256(path: Path) -> str:
         for block in iter(lambda: stream.read(CHUNK_SIZE), b""):
             digest.update(block)
     return digest.hexdigest()
-

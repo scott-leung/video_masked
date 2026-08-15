@@ -14,6 +14,8 @@ from core import CancelledError, MediaFile, process_file, scan_media
 
 
 APP_NAME = "HashVeil"
+APP_VERSION = "1.1.0"
+PAGE_SIZE = 500
 BG, PANEL, PANEL_2 = "#111318", "#191c23", "#222631"
 TEXT, MUTED, ACCENT, GOOD, BAD = "#f4f5f7", "#979eaa", "#6ee7b7", "#52d39a", "#ff7185"
 
@@ -38,6 +40,8 @@ class HashVeilApp(tk.Tk):
         self._cancel = threading.Event()
         self._running = False
         self._files: list[MediaFile] = []
+        self._file_states: list[str] = []
+        self._page = 0
         self._build_style()
         self._build_ui()
         self.after(80, self._poll_events)
@@ -76,7 +80,7 @@ class HashVeilApp(tk.Tk):
         self.source_var = tk.StringVar()
         self.output_var = tk.StringVar()
         self.mode_var = tk.StringVar(value="输出到新文件夹（推荐）")
-        self.workers_var = tk.StringVar(value=str(min(4, os.cpu_count() or 2)))
+        self.workers_var = tk.StringVar(value=str(min(16, max(4, (os.cpu_count() or 4) * 2))))
         self._row(pick, 0, "源文件夹", self.source_var, self._choose_source)
         self._row(pick, 1, "输出位置", self.output_var, self._choose_output)
         ttk.Label(pick, text="处理方式", background=PANEL, foreground=MUTED).grid(row=2, column=0, sticky="w", pady=(10, 0))
@@ -84,7 +88,7 @@ class HashVeilApp(tk.Tk):
         mode.grid(row=2, column=1, sticky="w", padx=(12, 18), pady=(10, 0))
         mode.bind("<<ComboboxSelected>>", lambda _e: self._sync_mode())
         ttk.Label(pick, text="并发任务", background=PANEL, foreground=MUTED).grid(row=2, column=2, sticky="e", pady=(10, 0))
-        ttk.Combobox(pick, textvariable=self.workers_var, state="readonly", values=("1", "2", "4", "6", "8"), width=5).grid(row=2, column=3, sticky="e", pady=(10, 0))
+        ttk.Combobox(pick, textvariable=self.workers_var, state="normal", values=("1", "2", "4", "8", "16", "24", "32", "48", "64"), width=5).grid(row=2, column=3, sticky="e", pady=(10, 0))
         pick.columnconfigure(1, weight=1)
 
         controls = ttk.Frame(outer)
@@ -123,6 +127,15 @@ class HashVeilApp(tk.Tk):
         self.tree.column("size", width=110, anchor="e")
         self.tree.column("state", width=110, anchor="center")
         self.tree.pack(fill="both", expand=True, pady=(14, 0))
+        pager = ttk.Frame(outer)
+        pager.pack(fill="x", pady=(8, 0))
+        self.prev_btn = ttk.Button(pager, text="上一页", command=lambda: self._change_page(-1), state="disabled")
+        self.prev_btn.pack(side="left")
+        self.page_var = tk.StringVar(value="第 0 / 0 页")
+        ttk.Label(pager, textvariable=self.page_var, style="Muted.TLabel").pack(side="left", padx=14)
+        self.next_btn = ttk.Button(pager, text="下一页", command=lambda: self._change_page(1), state="disabled")
+        self.next_btn.pack(side="left")
+        ttk.Label(pager, text=f"每页 {PAGE_SIZE} 条", style="Muted.TLabel").pack(side="right")
         self.protocol("WM_DELETE_WINDOW", self._close)
 
     def _row(self, parent, row, label, variable, command) -> None:
@@ -166,11 +179,18 @@ class HashVeilApp(tk.Tk):
         threading.Thread(target=lambda: self._events.put(("scanned", scan_media(source, output))), daemon=True).start()
 
     def _start(self):
+        try:
+            workers = int(self.workers_var.get())
+            if not 1 <= workers <= 64: raise ValueError
+        except ValueError:
+            messagebox.showwarning(APP_NAME, "并发任务数必须是 1 到 64 之间的整数。")
+            return
         if self.mode_var.get().startswith("直接") and not messagebox.askyesno(APP_NAME, "此模式会直接修改原文件。建议提前备份。\n\n确定继续吗？"):
             return
         self._running, self._cancel = True, threading.Event()
         self.scan_btn.config(state="disabled"); self.start_btn.config(state="disabled"); self.cancel_btn.config(state="normal")
-        for item in self.tree.get_children(): self.tree.set(item, "state", "等待")
+        self._file_states = ["等待"] * len(self._files)
+        self._show_page()
         threading.Thread(target=self._run_batch, daemon=True).start()
 
     def _run_batch(self):
@@ -189,7 +209,7 @@ class HashVeilApp(tk.Tk):
             process_file(media.source, dest, in_place=in_place, cancel=self._cancel, on_bytes=add_bytes)
             return index
         ok, failed = 0, []
-        with ThreadPoolExecutor(max_workers=int(self.workers_var.get())) as pool:
+        with ThreadPoolExecutor(max_workers=min(64, max(1, int(self.workers_var.get())))) as pool:
             futures = {pool.submit(one, i, f): (i, f) for i, f in enumerate(self._files)}
             for future in as_completed(futures):
                 i, media = futures[future]
@@ -214,8 +234,14 @@ class HashVeilApp(tk.Tk):
                     self.progress["value"] = pct; self.percent_var.set(f"{pct:.0f}%")
                     self.speed_value.config(text=f"{human_bytes(done / max(elapsed, .01))}/s")
                 elif kind == "file":
-                    i, state = event[1:]; items = self.tree.get_children()
-                    if i < len(items): self.tree.set(items[i], "state", state)
+                    i, state = event[1:]
+                    if i < len(self._file_states):
+                        self._file_states[i] = state
+                        start = self._page * PAGE_SIZE
+                        if start <= i < start + PAGE_SIZE:
+                            items = self.tree.get_children()
+                            row = i - start
+                            if row < len(items): self.tree.set(items[row], "state", state)
                 elif kind == "done_count": self.done_value.config(text=f"{event[1] + event[2]} / {event[3]}")
                 elif kind == "finished": self._finished(*event[1:])
         except queue.Empty: pass
@@ -223,12 +249,34 @@ class HashVeilApp(tk.Tk):
 
     def _show_scan(self, files):
         self._files = files
-        self.tree.delete(*self.tree.get_children())
-        for f in files: self.tree.insert("", "end", values=(str(f.relative), human_bytes(f.size), "等待"))
+        self._file_states = ["等待"] * len(files)
+        self._page = 0
+        self._show_page()
         total = sum(f.size for f in files)
         self.count_value.config(text=str(len(files))); self.size_value.config(text=human_bytes(total)); self.done_value.config(text=f"0 / {len(files)}")
         self.status_var.set(f"扫描完成，找到 {len(files)} 个媒体文件")
         self.scan_btn.config(state="normal"); self.start_btn.config(state="normal" if files else "disabled")
+
+    def _show_page(self):
+        self.tree.delete(*self.tree.get_children())
+        pages = (len(self._files) + PAGE_SIZE - 1) // PAGE_SIZE
+        if pages == 0:
+            self._page = 0
+        else:
+            self._page = min(max(0, self._page), pages - 1)
+        start = self._page * PAGE_SIZE
+        end = min(start + PAGE_SIZE, len(self._files))
+        for index in range(start, end):
+            media = self._files[index]
+            state = self._file_states[index] if index < len(self._file_states) else "等待"
+            self.tree.insert("", "end", values=(str(media.relative), human_bytes(media.size), state))
+        self.page_var.set(f"第 {self._page + 1 if pages else 0} / {pages} 页 · {start + 1 if self._files else 0}–{end} / {len(self._files)}")
+        self.prev_btn.config(state="normal" if self._page > 0 else "disabled")
+        self.next_btn.config(state="normal" if self._page + 1 < pages else "disabled")
+
+    def _change_page(self, delta):
+        self._page += delta
+        self._show_page()
 
     def _finished(self, ok, failed, cancelled, output):
         self._running = False
@@ -250,4 +298,3 @@ class HashVeilApp(tk.Tk):
 
 if __name__ == "__main__":
     HashVeilApp().mainloop()
-
