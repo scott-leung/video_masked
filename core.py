@@ -8,7 +8,7 @@ import struct
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterator
 
 
 MEDIA_EXTENSIONS = {
@@ -35,10 +35,9 @@ class MediaFile:
     size: int
 
 
-def scan_media(folder: Path, output_folder: Path | None = None) -> list[MediaFile]:
+def iter_media(folder: Path, output_folder: Path | None = None) -> Iterator[MediaFile]:
     folder = folder.resolve()
     excluded = output_folder.resolve() if output_folder else None
-    found: list[MediaFile] = []
     # scandir exposes Win32 directory metadata directly. Unlike Path.stat() in an
     # os.walk loop, entry.stat() normally reuses that metadata and avoids an extra
     # filesystem round-trip for every file (very noticeable on HDDs/NAS shares).
@@ -57,12 +56,16 @@ def scan_media(folder: Path, output_folder: Path | None = None) -> list[MediaFil
                             suffix = os.path.splitext(entry.name)[1].lower()
                             if suffix in MEDIA_EXTENSIONS:
                                 path = Path(entry.path)
-                                found.append(MediaFile(path, path.relative_to(folder), entry.stat(follow_symlinks=False).st_size))
+                                yield MediaFile(path, path.relative_to(folder), entry.stat(follow_symlinks=False).st_size)
                     except OSError:
                         continue
         except OSError:
             continue
-    return found
+
+
+def scan_media(folder: Path, output_folder: Path | None = None) -> list[MediaFile]:
+    """Compatibility helper for callers that explicitly need a complete list."""
+    return list(iter_media(folder, output_folder))
 
 
 def _existing_footer_size(path: Path) -> int:

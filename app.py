@@ -6,15 +6,15 @@ import subprocess
 import threading
 import time
 import tkinter as tk
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from core import CancelledError, MediaFile, process_file, scan_media
+from core import CancelledError, MediaFile, iter_media, process_file
 
 
 APP_NAME = "HashVeil"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 PAGE_SIZE = 500
 BG, PANEL, PANEL_2 = "#111318", "#191c23", "#222631"
 TEXT, MUTED, ACCENT, GOOD, BAD = "#f4f5f7", "#979eaa", "#6ee7b7", "#52d39a", "#ff7185"
@@ -39,6 +39,7 @@ class HashVeilApp(tk.Tk):
         self._events: queue.Queue = queue.Queue()
         self._cancel = threading.Event()
         self._running = False
+        self._scan_finished = False
         self._files: list[MediaFile] = []
         self._file_states: list[str] = []
         self._page = 0
@@ -93,10 +94,8 @@ class HashVeilApp(tk.Tk):
 
         controls = ttk.Frame(outer)
         controls.pack(fill="x", pady=(0, 12))
-        self.scan_btn = ttk.Button(controls, text="扫描媒体", command=self._scan)
-        self.scan_btn.pack(side="left")
-        self.start_btn = ttk.Button(controls, text="开始处理", style="Accent.TButton", command=self._start, state="disabled")
-        self.start_btn.pack(side="left", padx=10)
+        self.start_btn = ttk.Button(controls, text="边扫描边处理", style="Accent.TButton", command=self._start)
+        self.start_btn.pack(side="left")
         self.cancel_btn = ttk.Button(controls, text="取消", command=self._request_cancel, state="disabled")
         self.cancel_btn.pack(side="left")
         self.open_btn = ttk.Button(controls, text="打开输出目录", command=self._open_output, state="disabled")
@@ -106,13 +105,13 @@ class HashVeilApp(tk.Tk):
         metrics.pack(fill="x")
         self.count_value = self._metric(metrics, "0", "媒体文件", 0)
         self.size_value = self._metric(metrics, "0 B", "总大小", 1)
-        self.done_value = self._metric(metrics, "0 / 0", "已完成", 2)
+        self.done_value = self._metric(metrics, "0", "已完成", 2)
         self.speed_value = self._metric(metrics, "0 MB/s", "实时速度", 3)
         for i in range(4): metrics.columnconfigure(i, weight=1)
 
         progress_frame = ttk.Frame(outer)
         progress_frame.pack(fill="x", pady=(16, 10))
-        self.status_var = tk.StringVar(value="选择源文件夹后开始扫描")
+        self.status_var = tk.StringVar(value="选择源文件夹后即可边扫描边处理")
         ttk.Label(progress_frame, textvariable=self.status_var).pack(side="left")
         self.percent_var = tk.StringVar(value="0%")
         ttk.Label(progress_frame, textvariable=self.percent_var, style="Muted.TLabel").pack(side="right")
@@ -168,17 +167,11 @@ class HashVeilApp(tk.Tk):
             source = self.source_var.get()
             if source: self.output_var.set(str(Path(source).parent / f"{Path(source).name}_HashVeil"))
 
-    def _scan(self):
+    def _start(self):
         source = Path(self.source_var.get())
         if not source.is_dir():
             messagebox.showwarning(APP_NAME, "请先选择有效的源文件夹。")
             return
-        output = None if self.mode_var.get().startswith("直接") else Path(self.output_var.get())
-        self.status_var.set("正在扫描媒体文件…")
-        self.scan_btn.config(state="disabled")
-        threading.Thread(target=lambda: self._events.put(("scanned", scan_media(source, output))), daemon=True).start()
-
-    def _start(self):
         try:
             workers = int(self.workers_var.get())
             if not 1 <= workers <= 64: raise ValueError
@@ -187,9 +180,15 @@ class HashVeilApp(tk.Tk):
             return
         if self.mode_var.get().startswith("直接") and not messagebox.askyesno(APP_NAME, "此模式会直接修改原文件。建议提前备份。\n\n确定继续吗？"):
             return
-        self._running, self._cancel = True, threading.Event()
-        self.scan_btn.config(state="disabled"); self.start_btn.config(state="disabled"); self.cancel_btn.config(state="normal")
-        self._file_states = ["等待"] * len(self._files)
+        self._running, self._scan_finished, self._cancel = True, False, threading.Event()
+        self._files, self._file_states, self._page = [], [], 0
+        self._show_page()
+        self.start_btn.config(state="disabled"); self.cancel_btn.config(state="normal")
+        self.open_btn.config(state="disabled")
+        self.count_value.config(text="0"); self.size_value.config(text="0 B"); self.done_value.config(text="0")
+        self.speed_value.config(text="0 MB/s"); self.percent_var.set("扫描中")
+        self.progress.config(mode="indeterminate"); self.progress.start(12)
+        self.status_var.set("正在扫描 · 发现文件后立即处理…")
         self._show_page()
         threading.Thread(target=self._run_batch, daemon=True).start()
 
@@ -197,28 +196,43 @@ class HashVeilApp(tk.Tk):
         source_root = Path(self.source_var.get())
         in_place = self.mode_var.get().startswith("直接")
         output_root = source_root if in_place else Path(self.output_var.get())
-        total = sum(f.size for f in self._files) or 1
         state = {"bytes": 0, "lock": threading.Lock(), "start": time.monotonic()}
         def add_bytes(amount):
             with state["lock"]:
                 state["bytes"] += amount
-                self._events.put(("progress", state["bytes"], total, time.monotonic() - state["start"]))
+                self._events.put(("progress", state["bytes"], time.monotonic() - state["start"]))
         def one(index, media):
             dest = media.source if in_place else output_root / media.relative
             self._events.put(("file", index, "处理中"))
             process_file(media.source, dest, in_place=in_place, cancel=self._cancel, on_bytes=add_bytes)
             return index
-        ok, failed = 0, []
-        with ThreadPoolExecutor(max_workers=min(64, max(1, int(self.workers_var.get())))) as pool:
-            futures = {pool.submit(one, i, f): (i, f) for i, f in enumerate(self._files)}
-            for future in as_completed(futures):
-                i, media = futures[future]
+        ok, failed, discovered, total_bytes = 0, [], 0, 0
+        workers = min(64, max(1, int(self.workers_var.get())))
+        def collect(done_futures, futures):
+            nonlocal ok
+            for future in done_futures:
+                i, media = futures.pop(future)
                 try:
                     future.result(); ok += 1; self._events.put(("file", i, "完成"))
                 except CancelledError: self._events.put(("file", i, "已取消"))
                 except Exception as exc:
                     failed.append(f"{media.relative}: {exc}"); self._events.put(("file", i, "失败"))
-                self._events.put(("done_count", ok, len(failed), len(self._files)))
+                self._events.put(("done_count", ok, len(failed), discovered, False))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {}
+            for media in iter_media(source_root, None if in_place else output_root):
+                if self._cancel.is_set(): break
+                index = discovered; discovered += 1; total_bytes += media.size
+                self._events.put(("discovered", index, media, discovered, total_bytes))
+                future = pool.submit(one, index, media)
+                futures[future] = (index, media)
+                if len(futures) >= workers * 4:
+                    done, _ = wait(futures, return_when=FIRST_COMPLETED)
+                    collect(done, futures)
+            self._events.put(("scan_done", discovered, total_bytes, ok, len(failed)))
+            while futures:
+                done, _ = wait(futures, return_when=FIRST_COMPLETED)
+                collect(done, futures)
         self._events.put(("finished", ok, failed, self._cancel.is_set(), str(output_root)))
 
     def _request_cancel(self):
@@ -228,11 +242,17 @@ class HashVeilApp(tk.Tk):
         try:
             while True:
                 event = self._events.get_nowait(); kind = event[0]
-                if kind == "scanned": self._show_scan(event[1])
-                elif kind == "progress":
-                    _, done, total, elapsed = event; pct = min(100, done / total * 100)
-                    self.progress["value"] = pct; self.percent_var.set(f"{pct:.0f}%")
+                if kind == "progress":
+                    _, done, elapsed = event
                     self.speed_value.config(text=f"{human_bytes(done / max(elapsed, .01))}/s")
+                elif kind == "discovered":
+                    _, index, media, count, total_bytes = event
+                    self._files.append(media); self._file_states.append("等待")
+                    self.count_value.config(text=str(count)); self.size_value.config(text=human_bytes(total_bytes))
+                    if index // PAGE_SIZE == self._page:
+                        self.tree.insert("", "end", values=(str(media.relative), human_bytes(media.size), "等待"))
+                        self._update_pager()
+                    self.status_var.set(f"正在扫描 · 已发现 {count} · 处理同步进行中")
                 elif kind == "file":
                     i, state = event[1:]
                     if i < len(self._file_states):
@@ -242,20 +262,20 @@ class HashVeilApp(tk.Tk):
                             items = self.tree.get_children()
                             row = i - start
                             if row < len(items): self.tree.set(items[row], "state", state)
-                elif kind == "done_count": self.done_value.config(text=f"{event[1] + event[2]} / {event[3]}")
+                elif kind == "done_count":
+                    done, failed, found = event[1:4]
+                    self.done_value.config(text=str(done + failed))
+                    if self._scan_finished and found:
+                        pct = min(100, (done + failed) / found * 100); self.progress["value"] = pct; self.percent_var.set(f"{pct:.0f}%")
+                elif kind == "scan_done":
+                    self._scan_finished = True; self.progress.stop(); self.progress.config(mode="determinate", maximum=100)
+                    found, _, ok, failed = event[1:]
+                    pct = (ok + failed) / found * 100 if found else 100
+                    self.progress["value"] = pct; self.percent_var.set(f"{pct:.0f}%")
+                    self.status_var.set(f"扫描完成 · 共 {found} 个 · 正在完成剩余任务")
                 elif kind == "finished": self._finished(*event[1:])
         except queue.Empty: pass
         self.after(80, self._poll_events)
-
-    def _show_scan(self, files):
-        self._files = files
-        self._file_states = ["等待"] * len(files)
-        self._page = 0
-        self._show_page()
-        total = sum(f.size for f in files)
-        self.count_value.config(text=str(len(files))); self.size_value.config(text=human_bytes(total)); self.done_value.config(text=f"0 / {len(files)}")
-        self.status_var.set(f"扫描完成，找到 {len(files)} 个媒体文件")
-        self.scan_btn.config(state="normal"); self.start_btn.config(state="normal" if files else "disabled")
 
     def _show_page(self):
         self.tree.delete(*self.tree.get_children())
@@ -270,6 +290,12 @@ class HashVeilApp(tk.Tk):
             media = self._files[index]
             state = self._file_states[index] if index < len(self._file_states) else "等待"
             self.tree.insert("", "end", values=(str(media.relative), human_bytes(media.size), state))
+        self._update_pager()
+
+    def _update_pager(self):
+        pages = (len(self._files) + PAGE_SIZE - 1) // PAGE_SIZE
+        start = self._page * PAGE_SIZE
+        end = min(start + PAGE_SIZE, len(self._files))
         self.page_var.set(f"第 {self._page + 1 if pages else 0} / {pages} 页 · {start + 1 if self._files else 0}–{end} / {len(self._files)}")
         self.prev_btn.config(state="normal" if self._page > 0 else "disabled")
         self.next_btn.config(state="normal" if self._page + 1 < pages else "disabled")
@@ -280,7 +306,8 @@ class HashVeilApp(tk.Tk):
 
     def _finished(self, ok, failed, cancelled, output):
         self._running = False
-        self.scan_btn.config(state="normal"); self.start_btn.config(state="normal"); self.cancel_btn.config(state="disabled")
+        self.progress.stop(); self.progress.config(mode="determinate")
+        self.start_btn.config(state="normal"); self.cancel_btn.config(state="disabled")
         self.open_btn.config(state="normal" if not self.mode_var.get().startswith("直接") else "disabled")
         if not cancelled and not failed: self.progress["value"] = 100; self.percent_var.set("100%")
         self.status_var.set(("已取消" if cancelled else "处理完成") + f" · 成功 {ok} · 失败 {len(failed)}")
